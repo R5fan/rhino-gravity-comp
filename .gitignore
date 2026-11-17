@@ -1,0 +1,4 @@
+# your personal calibration - every stick is different
+rhino_gravity_comp.json
+__pycache__/
+*.pyc
