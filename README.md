@@ -57,6 +57,8 @@ What happens: the script first clears all effects from the stick. A temporary sp
 
 ## The live window
 
+![The live window: stick position and applied force, the force curves with the measured points, and the log](docs/live-window.png)
+
 The live window shows what the script is doing: the stick position and the force being applied, the force curves with the measured points, and every message the script prints, in a log panel with warnings in orange. The console keeps printing too. It uses tkinter, which comes with Python on Windows.
 
 - **Calibration** opens the window automatically. It stays open when calibration finishes so you can check the curves; close it to exit. Add `--no-gui` to calibrate without it.
