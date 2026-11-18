@@ -6,6 +6,8 @@ A free Python script for the **VPforce Rhino** force-feedback stick. If your sti
 
 > **Using VPforce TelemFFB?** Read the [TelemFFB warning](#warning-vpforce-telemffb) first.
 
+> **Master gain pot? Let the script control it.** If a pot on the stick is set to Master Gain in the configurator, the script can't see it. Turning that pot then weakens or strengthens the script's force along with everything else, and the stick sags or gets pushed again. Either leave the pot where it was when you calibrated, or hand master gain to the script (see [Master gain from the pot](#master-gain-from-the-pot-optional)). Moving the Master Gain slider in the configurator is fine: the script reads the slider and adjusts.
+
 ## What it does
 
 The script measures how hard gravity pulls the stick at several positions, then applies exactly the opposite force for wherever the stick is, updated about 200 times a second.
@@ -68,6 +70,8 @@ The live window shows what the script is doing: the stick position and the force
 
 ## Master gain from the pot (optional)
 
+> **Why this matters:** with the pot set to Master Gain in the configurator, the script can't tell when you turn it, so every turn throws its anti-sag force off. Letting the script control master gain fixes that: it then always knows the gain and keeps the stick balanced at any setting.
+
 If you use a pot on the stick as master gain, the script can take that job over, and then keep the anti-sag force correct at every gain setting. Without this, turning the gain down also weakens the script's force, so the stick sags again.
 
 1. In the VPforce configurator, set **Pot#1 Function** to an axis, for example **Rx**, instead of Master Gain.
@@ -129,7 +133,7 @@ Check the result with no centering force: let go of the stick aft, at centre and
 | A push remains after the script is closed | With all sims closed, run `py -3.13 rhino_gravity_comp.py --clear`, or unplug and replug the stick. The script also removes its own leftovers each time it starts. |
 | Stick creeps the same way at every position | Trim with `--tune`. |
 | Stick holds in the middle but drifts near the ends | Recalibrate with `--range 0.8` so the curve covers more of the travel. |
-| Force feels wrong after changing master gain | Calibrate once with this version: it records the gain, and from then on the force follows gain changes. If the pot is your master gain, use [the pot option](#master-gain-from-the-pot-optional). |
+| Force feels wrong after changing master gain | If you turned a pot that's set to Master Gain in the configurator: the script can't see it. Put the pot back where it was, or let the script control master gain (see [Master gain from the pot](#master-gain-from-the-pot-optional)). Changes made with the configurator's slider are followed automatically. |
 | Stick sags again mid-flight | Press `R`. |
 
 ## All options
