@@ -38,7 +38,7 @@ Calibration measures the pull across the stick's travel by itself, hands off, in
 
 1. Close every flight sim, and TelemFFB.
 2. In the VPforce configurator, make sure the constant-force slider isn't at 0. If a spring is switched on in the Effects tab, switch it off for the calibration.
-3. If you use a pot on the stick for master gain, set it where you normally fly, or let the script handle it (see [Master gain from the pot](#master-gain-from-the-pot-optional)).
+3. Master gain: if you never touch it, leave it as it is. If the script drives it from a pot (see [Master gain from the pot](#master-gain-from-the-pot-optional)), the script calibrates at 50% by itself and puts the gain back afterwards.
 4. Run:
 
    ```
@@ -78,11 +78,12 @@ If you use a pot on the stick as master gain, the script can take that job over,
    ```
 
    It reports where it found the pot and its range, for example `Found the pot: byte 11, 16-bit, range 0-4080`. Where the pot shows up in the stick's data can differ between firmware versions, which is why it's located rather than assumed.
-3. Calibrate once with this version (it records the gain it calibrated at), then fly as usual.
+3. Calibrate once with this version, then fly as usual. With a pot set up, calibration runs at 50% master gain by itself and puts the gain back afterwards, so the pot's position doesn't matter.
 
 While the script runs, turning the pot moves the configurator's Master Gain slider, and the script scales its own force to match. The status line shows the current gain and the pot's raw value.
 
 - **Safety:** the script doesn't touch Master Gain until it has seen the pot move. Until then the gain stays as it is, so a wrong or dead pot reading can't zero it.
+- **Beeps:** turning the pot gives a short pip at every 10% step, higher for more gain. The Rhino's own buzzer can't be driven from outside, so the pip is a tiny, fast vibration of the motors. It needs the configurator's Periodic Effects slider above 0. `--beep off` switches the pips off (saved).
 
 - `--gain-range 20 100` limits the pot's range, here from 20% to 100% master gain.
 - `--gain-pot off` switches it off again.
@@ -146,10 +147,11 @@ py -3.13 rhino_gravity_comp.py --help
 | `--pitch-only` | Calibrate pitch only |
 | `--points N` | Positions per axis during calibration (default 7) |
 | `--range R` | How far out to measure, as a fraction of full travel (default 0.7) |
-| `--max F` | Force limit, as a fraction of full (default 0.6) |
+| `--max F` | Force limit at the stick, as a fraction of full force at 100% gain (default 0.6) |
 | `--find-pot` | Locate the pot in the stick's data and let it drive Master Gain (saved) |
 | `--gain-pot off` | Stop the pot driving Master Gain (saved) |
 | `--gain-range LOW HIGH` | Master gain at the pot's two ends, in percent (saved) |
+| `--beep on` / `--beep off` | Pips through the motors when the pot changes master gain (saved) |
 
 ## License
 

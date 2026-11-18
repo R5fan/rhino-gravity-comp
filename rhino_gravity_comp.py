@@ -67,6 +67,7 @@ REP_CREATE_EFFECT = 5          # feature: [5, type, 0, 0]
 REP_BLOCK_LOAD = 6             # feature read: [6, effect_id, status, ...]
 REP_SET_EFFECT = 101           # <BBBHHHHBBBBH
 REP_SET_CONDITION = 103        # <BBBhhhHHH
+REP_SET_PERIODIC = 104         # <BBHhBH  magnitude 0..4096, offset, phase, period (ms)
 REP_SET_CONSTANT_FORCE = 105   # <BBh  magnitude -4096..4096
 REP_EFFECT_OPERATION = 110     # <BBBB
 REP_BLOCK_FREE = 111           # <BB
@@ -81,7 +82,7 @@ POT_AXES = ("z", "rz", "ry", "rx", "slider")
 POT_RAW = {"spec": None}       # set from config when --find-pot located the pot
 CONTROL_RESET = 4
 
-EFFECT_CONSTANT, EFFECT_SPRING = 1, 8
+EFFECT_CONSTANT, EFFECT_SINE, EFFECT_SPRING = 1, 4, 8
 LOAD_SUCCESS = 1
 OP_START, OP_STOP = 1, 3
 AXIS_X, AXIS_Y, AXIS_DIR = 1, 2, 4
@@ -211,7 +212,7 @@ def load_config():
             cfg[axis]["c"][0] = float(v)
         elif isinstance(v, dict):
             cfg[axis].update(v)
-    for key in ("gain", "gain_pot", "gain_range", "gain_pot_raw"):  # see GainKnob
+    for key in ("gain", "gain_pot", "gain_range", "gain_pot_raw", "beep"):  # see GainKnob
         if key in raw:
             cfg[key] = raw[key]
     return cfg
@@ -298,6 +299,7 @@ class HidDev:
 class Rhino:
     SLOT = 20         # park our force here, far above the slots sims use
     SPRING_SLOT = 21  # calibration spring, also out of the sim's way
+    BEEP_SLOT = 22    # short tones through the motors
     OUR_SLOTS = range(20, 26)   # anything here is ours (maybe left by a killed run)
 
     def __init__(self):
@@ -312,6 +314,7 @@ class Rhino:
         self.spring_id = None
         self.closing = False
         self.extra = {}                  # pot / extra axes, raw values
+        self.beep_id = None
         self.last_input = b""
         self.connect()
 
@@ -484,6 +487,25 @@ class Rhino:
                                            block, off, k, k, 4096, 4096, 0))
         self._guarded(_do)
 
+    # ---- beeps -------------------------------------------------------------
+    def beep(self, freq=440, ms=60, volume=0.2):
+        """A short tone played through the motors (a quick, tiny vibration).
+        The Rhino's own buzzer can't be driven from outside, so this is the
+        next best thing. Scaled by master gain and the Periodic slider."""
+        def _do():
+            if self.beep_id is None:
+                self.beep_id = self._create_high(EFFECT_SINE, self.BEEP_SLOT)
+                if not self.beep_id:
+                    return
+            self.dev.write(struct.pack("<BBBHHHHBBBBH", REP_SET_EFFECT, self.beep_id,
+                                       EFFECT_SINE, int(ms), 0, 0, 4096, 0,
+                                       AXIS_DIR | SOURCE_TELEMFFB, 0, 0, 0))
+            self.dev.write(struct.pack("<BBHhBH", REP_SET_PERIODIC, self.beep_id,
+                                       round(4096 * clamp(volume, 0, 1)), 0, 0,
+                                       max(1, round(1000 / freq))))
+            self.dev.write(struct.pack("<BBBB", REP_EFFECT_OPERATION, self.beep_id, OP_START, 1))
+        self._guarded(_do)
+
     # ---- configurator gain sliders ---------------------------------------
     def get_gains(self):
         """(master %, constant-force %) as the configurator sliders stand,
@@ -516,6 +538,7 @@ class Rhino:
             self.dev.write(bytes([REP_DEVICE_CONTROL, CONTROL_RESET]))
             time.sleep(0.2)
             self.spring_id = None
+            self.beep_id = None
             self.eid = self._create_high(EFFECT_CONSTANT)
             if not self.eid:
                 raise IOError("couldn't re-create the effect after reset")
@@ -552,6 +575,7 @@ class Rhino:
         for p in probes:
             self._free(p)
         if reclaimed:
+            self.beep_id = None
             print(f"\n[INFO] Effect had been wiped (the sim took or released the stick)"
                   f" - restored in slot {self.eid}")
         self.started = False
@@ -620,6 +644,8 @@ class Rhino:
             self.dev.write(struct.pack("<BBBB", REP_EFFECT_OPERATION, self.eid, OP_STOP, 0))
             self._free(self.eid)
             self.spring_free()
+            if self.beep_id:
+                self._free(self.beep_id)
         except Exception:
             pass
         self.dev.close()
@@ -635,14 +661,40 @@ def calibrate(args):
     rh = Rhino()
     rh.reset_device()          # clear leftovers (e.g. a spring from an interrupted run)
     gains = rh.get_gains()
+    restore_master = None
+    if gains and cfg.get("gain_pot"):
+        # The pot drives master gain, so its current position says nothing about
+        # the user's normal level: calibrate at a fixed 50%, then put it back.
+        restore_master = gains[0]
+        rh.set_master_gain(50)
+        time.sleep(0.2)
+        gains = rh.get_gains()
+        say(f"Master gain set to 50% for calibration (it goes back to {restore_master}% "
+            f"afterwards).")
+
+    def put_gain_back():
+        if restore_master is not None:
+            rh.set_master_gain(restore_master)
+            say(f"Master gain back to {restore_master}%.")
+
     if gains and gains[0] * gains[1] / 100.0 < 20:
-        say(f"Master gain is {gains[0]}% and the constant-force slider {gains[1]}%: too low to "
-            f"calibrate. Set both to your normal flying level in the configurator (at least "
-            f"20%), then run --calibrate again.")
+        if cfg.get("gain_pot"):
+            say(f"The constant-force slider is at {gains[1]}%: too low to calibrate (at 50% "
+                f"master gain it needs at least 40%). Raise it in the configurator, then run "
+                f"--calibrate again.")
+        else:
+            say(f"Master gain is {gains[0]}% and the constant-force slider {gains[1]}%: too low "
+                f"to calibrate. Set both to your normal flying level in the configurator (at "
+                f"least 20%), then run --calibrate again.")
+        put_gain_back()
         rh.close()
         return
     axes = ["pitch"] + (["roll"] if not args.pitch_only else [])
     measured = []
+    # --max is the force AT THE STICK (as at 100% gain): at lower gain the same
+    # physical limit allows a proportionally bigger command
+    eff = gains[0] * gains[1] / 100.0 if gains else 100.0
+    lim = min(1.0, args.max * 100.0 / max(eff, 1.0))
     targets = [-args.range + 2 * args.range * i / (args.points - 1) for i in range(args.points)]
     say("\n=== CALIBRATION ===")
     say("Close all flight sims and TelemFFB first. The stick will be moved to several positions by a")
@@ -724,11 +776,11 @@ def calibrate(args):
                         continue
                     good = 0
                     step = clamp(-0.7 * err / sens, -0.05, 0.05)
-                    force[idx] = clamp(force[idx] + step, -args.max, args.max)
+                    force[idx] = clamp(force[idx] + step, -lim, lim)
                     setf()
                     nap(0.25)
                 u = rh.average_pos(0.5)[idx]
-                ok = abs(u - t) < 3 * args.tolerance and abs(force[idx]) < args.max - 1e-6
+                ok = abs(u - t) < 3 * args.tolerance and abs(force[idx]) < lim - 1e-6
                 say(f"\r[{axis}] at {u:+.3f} gravity needs {force[idx]:+.3f}"
                       f"{'' if ok else '   (not settled - skipped)'}                  ")
                 if ok:
@@ -762,6 +814,11 @@ def calibrate(args):
     except KeyboardInterrupt:
         say("\nAborted, nothing saved.")
     finally:
+        rh.closing = True                 # poll() mustn't raise during cleanup
+        try:
+            put_gain_back()
+        except Exception:
+            pass
         rh.close()
 
 
@@ -772,11 +829,12 @@ def make_forces(cfg, args, knob=None):
     """force(pos) from the calibrated curves, rescaled when the gain sliders
     differ from what they were at calibration (so the push AT THE STICK stays
     the same when you turn the gain down or up)."""
-    lim = min(args.max, 1.0)
-
     def forces(pos):
         u = pos if pos else (0.0, 0.0)
         scale = knob.scale() if knob else 1.0
+        eff = knob.effective() if knob else None
+        # --max is the force at the stick (as at 100% gain)
+        lim = min(1.0, args.max * 100.0 / max(eff, 1.0)) if eff else min(args.max, 1.0)
         r = curve_force(cfg["roll"], u[0]) * scale
         p = curve_force(cfg["pitch"], u[1]) * scale
         if knob:
@@ -805,6 +863,8 @@ class GainKnob:
         self.log_at = 0.0
         self.armed = False
         self.first_v = None
+        self.beep_on = cfg.get("beep", True)
+        self.beep_bucket = None
         if self.axis == "raw":
             POT_RAW["spec"] = cfg.get("gain_pot_raw")
             if not POT_RAW["spec"]:
@@ -836,6 +896,8 @@ class GainKnob:
                 if abs(v - self.first_v) >= 0.03:
                     self.armed = True
                     print("\n[GAIN] Pot detected - master gain now follows it.")
+                    if self.beep_on:
+                        self.rh.beep(660, 50)
                 else:
                     v = "wait"
             if v == "wait":
@@ -856,6 +918,7 @@ class GainKnob:
                     self.rh.set_master_gain(target)
                     self.set_val = self.master = target
                     self.next_write = now + 0.1
+                    self.maybe_beep(target)
                     self.log_at = now + 0.6          # report once the pot stops moving
                     if first:
                         self.log_at = 0.0
@@ -880,6 +943,22 @@ class GainKnob:
             print(f"\n[WARN] At {self.master}% master gain the script can't push hard enough "
                   f"to fully hold the stick (limit --max). Turn the gain up, or allow more "
                   f"with --max.")
+
+    def maybe_beep(self, gain):
+        """A pip each time the gain crosses a 10% step, higher for more gain."""
+        bucket = int(gain // 10)
+        if self.beep_bucket is None:
+            self.beep_bucket = bucket
+            return
+        if bucket != self.beep_bucket:
+            self.beep_bucket = bucket
+            if self.beep_on:
+                # the tone is itself scaled by master gain: keep it audible when low
+                vol = clamp(0.15 / max(gain / 100.0, 0.25), 0.0, 0.6)
+                # the stick takes the tone's period in whole ms: 10 ms (100 Hz) at
+                # 0% up to 3 ms (333 Hz) at 100%, so each step sounds different
+                period = 10 - round(7 * gain / 100)
+                self.rh.beep(1000 / period, 45, vol)
 
     def effective(self):
         if self.master is None or self.const is None:
@@ -1303,19 +1382,24 @@ def main():
                          "(saved; 'off' to stop)")
     ap.add_argument("--gain-range", type=int, nargs=2, metavar=("LOW", "HIGH"),
                     help="master gain at the pot's two ends, in percent (saved; default 0 100)")
+    ap.add_argument("--beep", choices=("on", "off"),
+                    help="pips through the motors when the pot changes master gain (saved)")
     ap.add_argument("--check", type=float, default=1.0,
                     help="seconds between 'effect still alive?' checks, 0 = off")
     args = ap.parse_args()
     args.points = max(3, args.points)
-    if args.gain_pot or args.gain_range:
+    if args.gain_pot or args.gain_range or args.beep:
         cfg = load_config()
+        if args.beep:
+            cfg["beep"] = args.beep == "on"
         if args.gain_pot:
             cfg["gain_pot"] = None if args.gain_pot == "off" else args.gain_pot
         if args.gain_range:
             lo, hi = (int(clamp(v, 0, 100)) for v in args.gain_range)
             cfg["gain_range"] = [lo, hi]
         save_config(cfg)
-        print(f"Gain pot: {cfg.get('gain_pot') or 'off'}, range {cfg.get('gain_range') or [0, 100]}%")
+        print(f"Gain pot: {cfg.get('gain_pot') or 'off'}, range {cfg.get('gain_range') or [0, 100]}%,"
+              f" beeps {'on' if cfg.get('beep', True) else 'off'}")
         return
     sys.stdout = Tee(sys.stdout)
     if args.find_pot:
