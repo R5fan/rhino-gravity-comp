@@ -40,8 +40,10 @@ import os
 import struct
 import sys
 import signal
+import tempfile
 import threading
 import time
+import wave
 
 try:
     import hid  # 'hidapi' package (pip install hidapi) or 'hid' package
@@ -62,12 +64,48 @@ except ImportError:
     winsound = None
 
 
-def pc_beep(freq, ms=50):
-    """A short beep on the PC, played in the background so nothing waits."""
+_BEEP_DIR = os.path.join(tempfile.gettempdir(), "rhino_gravity_comp_beeps")
+
+
+def _beep_file(freq, ms):
+    """A short sine tone with a soft fade in and out (no clicks), cached as a
+    small .wav file so Windows can play it in the background."""
+    path = os.path.join(_BEEP_DIR, f"beep_{freq}_{ms}.wav")
+    if not os.path.exists(path):
+        os.makedirs(_BEEP_DIR, exist_ok=True)
+        rate = 44100
+        n = int(rate * ms / 1000)
+        fade = max(1, int(rate * 0.006))            # 6 ms raised-cosine fade
+        frames = bytearray()
+        for i in range(n):
+            env = 1.0
+            if i < fade:
+                env = 0.5 - 0.5 * math.cos(math.pi * i / fade)
+            elif i >= n - fade:
+                env = 0.5 - 0.5 * math.cos(math.pi * (n - 1 - i) / fade)
+            frames += struct.pack("<h", int(0.35 * 32767 * env *
+                                            math.sin(2 * math.pi * freq * i / rate)))
+        tmp = path + ".tmp"
+        with wave.open(tmp, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(bytes(frames))
+        os.replace(tmp, path)
+    return path
+
+
+def pc_beep(freq, ms=35):
+    """A short, click-free beep on the PC. Plays in the background; a new beep
+    replaces one that's still playing instead of overlapping it."""
     if not winsound:
         return
-    threading.Thread(target=lambda: winsound.Beep(int(clamp(freq, 37, 32767)), int(ms)),
-                     daemon=True).start()
+    try:
+        f = int(round(clamp(freq, 100, 4000) / 10) * 10)
+        winsound.PlaySound(_beep_file(f, int(ms)), winsound.SND_FILENAME |
+                           winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception:
+        pass
 
 # --------------------------------------------------------------------------
 # Rhino HID protocol (from VPforce TelemFFB, telemffb/hw/ffb_rhino.py)
@@ -224,7 +262,7 @@ def load_config():
             cfg[axis]["c"][0] = float(v)
         elif isinstance(v, dict):
             cfg[axis].update(v)
-    for key in ("gain", "gain_pot", "gain_range", "gain_pot_raw", "beep"):  # see GainKnob
+    for key in ("gain", "gain_pot", "gain_range", "gain_pot_raw", "beep", "beep_step"):
         if key in raw:
             cfg[key] = raw[key]
     return cfg
@@ -851,6 +889,7 @@ class GainKnob:
         self.armed = False
         self.first_v = None
         self.beep_on = cfg.get("beep", True)
+        self.beep_step = max(1, int(cfg.get("beep_step", 2)))
         self.beep_bucket = None
         if self.axis == "raw":
             POT_RAW["spec"] = cfg.get("gain_pot_raw")
@@ -884,7 +923,7 @@ class GainKnob:
                     self.armed = True
                     print("\n[GAIN] Pot detected - master gain now follows it.")
                     if self.beep_on:
-                        pc_beep(880, 60)
+                        pc_beep(1100, 60)
                 else:
                     v = "wait"
             if v == "wait":
@@ -932,15 +971,15 @@ class GainKnob:
                   f"with --max.")
 
     def maybe_beep(self, gain):
-        """A beep each time the gain crosses a 10% step, higher for more gain."""
-        bucket = int(gain // 10)
+        """A beep each time the gain crosses a step (default 2%), higher for more gain."""
+        bucket = int(gain // self.beep_step)
         if self.beep_bucket is None:
             self.beep_bucket = bucket
             return
         if bucket != self.beep_bucket:
             self.beep_bucket = bucket
             if self.beep_on:
-                pc_beep(400 + 6 * gain, 40)        # 400 Hz at 0% ... 1000 Hz at 100%
+                pc_beep(400 + 6 * gain)            # 400 Hz at 0% ... 1000 Hz at 100%
 
     def effective(self):
         if self.master is None or self.const is None:
@@ -1366,14 +1405,18 @@ def main():
                     help="master gain at the pot's two ends, in percent (saved; default 0 100)")
     ap.add_argument("--beep", choices=("on", "off"),
                     help="beep on the PC when the pot changes master gain (saved)")
+    ap.add_argument("--beep-step", type=int, metavar="PERCENT",
+                    help="beep every this many percent of master gain (saved; default 2)")
     ap.add_argument("--check", type=float, default=1.0,
                     help="seconds between 'effect still alive?' checks, 0 = off")
     args = ap.parse_args()
     args.points = max(3, args.points)
-    if args.gain_pot or args.gain_range or args.beep:
+    if args.gain_pot or args.gain_range or args.beep or args.beep_step:
         cfg = load_config()
         if args.beep:
             cfg["beep"] = args.beep == "on"
+        if args.beep_step:
+            cfg["beep_step"] = max(1, min(50, args.beep_step))
         if args.gain_pot:
             cfg["gain_pot"] = None if args.gain_pot == "off" else args.gain_pot
         if args.gain_range:
@@ -1381,7 +1424,7 @@ def main():
             cfg["gain_range"] = [lo, hi]
         save_config(cfg)
         print(f"Gain pot: {cfg.get('gain_pot') or 'off'}, range {cfg.get('gain_range') or [0, 100]}%,"
-              f" beeps {'on' if cfg.get('beep', True) else 'off'}")
+              f" beeps {'on' if cfg.get('beep', True) else 'off'} every {cfg.get('beep_step', 2)}%")
         return
     sys.stdout = Tee(sys.stdout)
     if args.find_pot:
