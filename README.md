@@ -38,7 +38,7 @@ Calibration measures the pull across the stick's travel by itself, hands off, in
 
 1. Close every flight sim, and TelemFFB.
 2. In the VPforce configurator, make sure the constant-force slider isn't at 0. If a spring is switched on in the Effects tab, switch it off for the calibration.
-3. If you use a pot on the stick for master gain, set it where you normally fly. The script's force scales with it.
+3. If you use a pot on the stick for master gain, set it where you normally fly, or let the script handle it (see [Master gain from the pot](#master-gain-from-the-pot-optional)).
 4. Run:
 
    ```
@@ -65,6 +65,27 @@ The live window shows what the script is doing: the stick position and the force
 - **Flying and trim** start with the window hidden. Add `--gui` to start with it showing.
 - **Press G** in the console to show or hide the window at any time, or press G in the window to hide it. Closing the window with X only hides it; the script keeps running.
 - **Keys work in the window too:** R while flying, and the trim keys.
+
+## Master gain from the pot (optional)
+
+If you use a pot on the stick as master gain, the script can take that job over, and then keep the anti-sag force correct at every gain setting. Without this, turning the gain down also weakens the script's force, so the stick sags again.
+
+1. In the VPforce configurator, set **Pot#1 Function** to an axis, for example **Rx**, instead of Master Gain.
+2. Tell the script once which axis it is (it's saved):
+
+   ```
+   py -3.13 rhino_gravity_comp.py --gain-pot rx
+   ```
+
+3. Calibrate once with this version (it records the gain it calibrated at), then fly as usual.
+
+While the script runs, turning the pot moves the configurator's Master Gain slider, and the script scales its own force to match. The status line shows the current gain and the pot's raw value.
+
+- `--gain-range 20 100` limits the pot's range, here from 20% to 100% master gain.
+- `--gain-pot off` switches it off again.
+- The pot only works while the script runs. When it stops, the master gain stays where it was. Keep the emergency stop within reach, since the pot is no longer a direct "turn it all down" knob.
+- At low gain the script needs more force of its own. If it hits its limit, it warns you and the stick sags a little. Turn the gain up, or allow more with `--max`.
+- The configurator's slider may not move along on screen while the configurator is open.
 
 ## Flying with it
 
@@ -104,7 +125,7 @@ Check the result with no centering force: let go of the stick aft, at centre and
 | A push remains after the script is closed | With all sims closed, run `py -3.13 rhino_gravity_comp.py --clear`, or unplug and replug the stick. The script also removes its own leftovers each time it starts. |
 | Stick creeps the same way at every position | Trim with `--tune`. |
 | Stick holds in the middle but drifts near the ends | Recalibrate with `--range 0.8` so the curve covers more of the travel. |
-| Force feels wrong after changing master gain | The force scales with the master gain. Recalibrate at the gain you fly with. |
+| Force feels wrong after changing master gain | Calibrate once with this version: it records the gain, and from then on the force follows gain changes. If the pot is your master gain, use [the pot option](#master-gain-from-the-pot-optional). |
 | Stick sags again mid-flight | Press `R`. |
 
 ## All options
@@ -123,6 +144,8 @@ py -3.13 rhino_gravity_comp.py --help
 | `--points N` | Positions per axis during calibration (default 7) |
 | `--range R` | How far out to measure, as a fraction of full travel (default 0.7) |
 | `--max F` | Force limit, as a fraction of full (default 0.6) |
+| `--gain-pot AXIS` | Let a pot on this axis (`rx`, `ry`, `rz`, `z`, `slider`) drive Master Gain; `off` to stop (saved) |
+| `--gain-range LOW HIGH` | Master gain at the pot's two ends, in percent (saved) |
 
 ## License
 

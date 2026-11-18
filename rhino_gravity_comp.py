@@ -71,6 +71,13 @@ REP_SET_CONSTANT_FORCE = 105   # <BBh  magnitude -4096..4096
 REP_EFFECT_OPERATION = 110     # <BBBB
 REP_BLOCK_FREE = 111           # <BB
 REP_DEVICE_CONTROL = 112       # [112, 4] = reset: wipes ALL effects on the stick
+REP_GET_GAINS = 0x56           # feature: id, master, periodic, spring, damper,
+                               #   inertia, friction, constant (whole percent)
+REP_SET_GAIN = 0x57            # feature: id, slider id, value (0-100 percent)
+GAIN_MASTER = 1                # configurator slider ids (TelemFFB FFB_GAIN_*)
+
+# extra axes in the input report: <BhhhBBBB = id, X, Y, Z, Rz, Ry, Rx, Slider
+POT_AXES = ("z", "rz", "ry", "rx", "slider")
 CONTROL_RESET = 4
 
 EFFECT_CONSTANT, EFFECT_SPRING = 1, 8
@@ -203,6 +210,9 @@ def load_config():
             cfg[axis]["c"][0] = float(v)
         elif isinstance(v, dict):
             cfg[axis].update(v)
+    for key in ("gain", "gain_pot", "gain_range"):  # see GainKnob
+        if key in raw:
+            cfg[key] = raw[key]
     return cfg
 
 
@@ -300,6 +310,7 @@ class Rhino:
         self.last_report_t = 0.0
         self.spring_id = None
         self.closing = False
+        self.extra = {}                  # pot / extra axes, raw values
         self.connect()
 
     # ---- connection / allocation ----------------------------------------
@@ -389,6 +400,9 @@ class Rhino:
             return True
         if latest:
             _, x, y = struct.unpack_from("<Bhh", latest)
+            if len(latest) >= 11:
+                z, rz, ry, rx, sl = struct.unpack_from("<hBBBB", latest, 5)
+                self.extra = {"z": z, "rz": rz, "ry": ry, "rx": rx, "slider": sl}
             now = time.perf_counter()
             raw = (clamp(x / 4096, -1, 1), clamp(y / 4096, -1, 1))
             if self.pos is None:
@@ -463,6 +477,27 @@ class Rhino:
                 self.dev.write(struct.pack("<BBBhhhHHH", REP_SET_CONDITION, self.spring_id,
                                            block, off, k, k, 4096, 4096, 0))
         self._guarded(_do)
+
+    # ---- configurator gain sliders ---------------------------------------
+    def get_gains(self):
+        """(master %, constant-force %) as the configurator sliders stand,
+        or None if the stick doesn't answer."""
+        try:
+            r = self.dev.get_feature(REP_GET_GAINS, 8)
+            if len(r) >= 8 and r[0] == REP_GET_GAINS:
+                return r[1], r[7]
+        except Exception:
+            pass
+        return None
+
+    def effective_gain(self):
+        g = self.get_gains()
+        return g[0] * g[1] / 100.0 if g else None
+
+    def set_master_gain(self, percent):
+        """Move the configurator's Master Gain slider (0-100)."""
+        self._guarded(lambda: self.dev.send_feature(
+            [REP_SET_GAIN, GAIN_MASTER, int(clamp(percent, 0, 100))]))
 
     def reset_device(self):
         """Wipe every effect on the stick (leftovers from an interrupted run,
@@ -703,6 +738,7 @@ def calibrate(args):
             setf()
             nap(0.8)
         SH.target = None
+        cfg["gain"] = rh.effective_gain()
         save_config(cfg)
         SH.status = "Calibration done and saved - close the window."
     except KeyboardInterrupt:
@@ -714,15 +750,105 @@ def calibrate(args):
 # --------------------------------------------------------------------------
 # Running
 # --------------------------------------------------------------------------
-def make_forces(cfg, args):
+def make_forces(cfg, args, knob=None):
+    """force(pos) from the calibrated curves, rescaled when the gain sliders
+    differ from what they were at calibration (so the push AT THE STICK stays
+    the same when you turn the gain down or up)."""
     lim = min(args.max, 1.0)
 
     def forces(pos):
         u = pos if pos else (0.0, 0.0)
-        r = curve_force(cfg["roll"], u[0])
-        p = curve_force(cfg["pitch"], u[1])
+        scale = knob.scale() if knob else 1.0
+        r = curve_force(cfg["roll"], u[0]) * scale
+        p = curve_force(cfg["pitch"], u[1]) * scale
+        if knob:
+            knob.clipped = max(abs(r), abs(p)) > lim
         return clamp(r, -lim, lim), clamp(p, -lim, lim)
     return forces
+
+
+class GainKnob:
+    """Optional: a pot assigned to an axis (e.g. Rx) drives the configurator's
+    Master Gain slider. Also tracks the gains so forces can be rescaled."""
+
+    def __init__(self, rh, cfg):
+        self.rh, self.cfg = rh, cfg
+        self.axis = cfg.get("gain_pot")
+        self.lo, self.hi = cfg.get("gain_range") or [0, 100]
+        g = rh.get_gains()
+        self.master, self.const = g if g else (None, None)
+        self.set_val = None
+        self.exact = None
+        self.next_write = 0.0
+        self.next_read = time.time() + 1.0
+        self.clipped = False
+        self.warned_clip = 0.0
+        self.warned_no_axis = False
+
+    def pot_fraction(self):
+        raw = self.rh.extra.get(self.axis)
+        if raw is None:
+            return None
+        if self.axis == "z":                       # int16, -4096..4096
+            return clamp((raw + 4096) / 8192, 0.0, 1.0)
+        return clamp(raw / 255, 0.0, 1.0)          # uint8 axes
+
+    def update(self):
+        now = time.time()
+        if self.axis:
+            v = self.pot_fraction()
+            if v is None:
+                if not self.warned_no_axis and now > self.next_read:
+                    self.warned_no_axis = True
+                    print(f"\n[WARN] No value from the {self.axis} axis yet - is the pot "
+                          f"assigned to it in the configurator?")
+            else:
+                exact = self.lo + v * (self.hi - self.lo)
+                self.exact = exact if self.exact is None else self.exact + 0.2 * (exact - self.exact)
+                target = int(round(self.exact))
+                # change only on a real move (hysteresis) and at most 10x a second
+                if (self.set_val is None or abs(self.exact - self.set_val) > 0.7) \
+                        and now >= self.next_write:
+                    self.rh.set_master_gain(target)
+                    self.set_val = self.master = target
+                    self.next_write = now + 0.1
+        if now >= self.next_read:                  # pick up slider changes made elsewhere
+            g = self.rh.get_gains()
+            if g:
+                if self.axis and self.set_val is not None and g[0] != self.set_val \
+                        and now >= self.next_write + 0.3:
+                    self.rh.set_master_gain(self.set_val)   # the pot is in charge
+                else:
+                    self.master = g[0]
+                self.const = g[1]
+            self.next_read = now + 1.0
+        if self.clipped and now - self.warned_clip > 10:
+            self.warned_clip = now
+            print(f"\n[WARN] At {self.master}% master gain the script can't push hard enough "
+                  f"to fully hold the stick (limit --max). Turn the gain up, or allow more "
+                  f"with --max.")
+
+    def effective(self):
+        if self.master is None or self.const is None:
+            return None
+        return self.master * self.const / 100.0
+
+    def scale(self):
+        cal, now = self.cfg.get("gain"), self.effective()
+        if not cal or now is None:
+            return 1.0                             # calibrated before gain tracking
+        if now <= 0:
+            return 0.0
+        return cal / now
+
+    def text(self):
+        if self.master is None:
+            return ""
+        t = f" | gain {self.master}%"
+        if self.axis:
+            raw = self.rh.extra.get(self.axis)
+            t += f" (pot {self.axis} {raw if raw is not None else '?'})"
+        return t
 
 
 def run(args):
@@ -731,9 +857,16 @@ def run(args):
         print("[INFO] Not calibrated yet - run with --calibrate first.")
     SH.cfg = cfg
     rh = Rhino()
-    forces = make_forces(cfg, args)
+    knob = GainKnob(rh, cfg)
+    forces = make_forces(cfg, args, knob)
     rh.average_pos(0.2)
     say("Gravity compensation ON - force follows the stick position.")
+    if knob.axis:
+        print(f"Master gain follows the pot on axis {knob.axis} "
+              f"({knob.lo}-{knob.hi}%). It stays where it is when the script stops.")
+    if not cfg.get("gain"):
+        print("[INFO] Calibrated before gain tracking existed: the force won't follow gain "
+              "changes until you run --calibrate once more.")
     print("Keep this running while flying.  R = re-create the effect if the stick sags again,"
           "  G = show/hide the live window,  Ctrl+C = stop.")
     try:
@@ -745,6 +878,7 @@ def run(args):
                 time.sleep(0.3)
                 rh.check_alive()
                 next_check = time.time() + args.check
+            knob.update()
             rh.set_force(*forces(rh.pos))
             while SH.keys:
                 if SH.keys.popleft().lower() == "r":
@@ -755,7 +889,8 @@ def run(args):
                 next_check = now + args.check
             if now >= next_status and rh.pos:
                 print(f"\rstick roll {rh.pos[0]:+.3f} pitch {rh.pos[1]:+.3f} | "
-                      f"force roll {rh.fx:+.3f} pitch {rh.fy:+.3f}   ", end="", flush=True)
+                      f"force roll {rh.fx:+.3f} pitch {rh.fy:+.3f}{knob.text()}   ",
+                      end="", flush=True)
                 next_status = now + 0.25
             time.sleep(0.004)
     except KeyboardInterrupt:
@@ -771,7 +906,8 @@ def tune(args):
     cfg = load_config()
     SH.cfg = cfg
     rh = Rhino()
-    forces = make_forces(cfg, args)
+    knob = GainKnob(rh, cfg)
+    forces = make_forces(cfg, args, knob)
     print("\n=== TRIM ===  let go of the stick; it should stay where you leave it")
     print("  w/s  shift pitch force +/- (W/S = big steps)")
     print("  a/d  shift roll force  +/- (A/D = big steps)")
@@ -783,6 +919,7 @@ def tune(args):
         next_status = 0.0
         while True:
             rh.poll()
+            knob.update()
             rh.set_force(*forces(rh.pos))
             if rh.pos and time.time() >= next_status:
                 print(f"\rshift roll {cfg['roll']['c'][0]:+.3f} pitch {cfg['pitch']['c'][0]:+.3f}"
@@ -798,10 +935,11 @@ def tune(args):
                     raise KeyboardInterrupt
                 if c == "q":
                     raise KeyboardInterrupt
-                if c == "w": cfg["pitch"]["c"][0] += step
-                if c == "s": cfg["pitch"]["c"][0] -= step
-                if c == "d": cfg["roll"]["c"][0] += step
-                if c == "a": cfg["roll"]["c"][0] -= step
+                k = knob.scale() or 1.0            # trim in "at the stick" units
+                if c == "w": cfg["pitch"]["c"][0] += step / k
+                if c == "s": cfg["pitch"]["c"][0] -= step / k
+                if c == "d": cfg["roll"]["c"][0] += step / k
+                if c == "a": cfg["roll"]["c"][0] -= step / k
             time.sleep(0.004)
     except KeyboardInterrupt:
         pass
@@ -1038,10 +1176,24 @@ def main():
                     help="how far out to measure, fraction of full travel (0.7)")
     ap.add_argument("--max", type=float, default=0.6, help="force limit, fraction of full (0.6)")
     ap.add_argument("--tolerance", type=float, default=0.006, help="calibration: close enough")
+    ap.add_argument("--gain-pot", choices=POT_AXES + ("off",),
+                    help="let a pot assigned to this axis drive the Master Gain slider "
+                         "(saved; 'off' to stop)")
+    ap.add_argument("--gain-range", type=int, nargs=2, metavar=("LOW", "HIGH"),
+                    help="master gain at the pot's two ends, in percent (saved; default 0 100)")
     ap.add_argument("--check", type=float, default=1.0,
                     help="seconds between 'effect still alive?' checks, 0 = off")
     args = ap.parse_args()
     args.points = max(3, args.points)
+    if args.gain_pot or args.gain_range:
+        cfg = load_config()
+        if args.gain_pot:
+            cfg["gain_pot"] = None if args.gain_pot == "off" else args.gain_pot
+        if args.gain_range:
+            lo, hi = (int(clamp(v, 0, 100)) for v in args.gain_range)
+            cfg["gain_range"] = [lo, hi]
+        save_config(cfg)
+        print(f"Gain pot: {cfg.get('gain_pot') or 'off'}, range {cfg.get('gain_range') or [0, 100]}%")
     sys.stdout = Tee(sys.stdout)
     if args.clear:
         rh = Rhino()
