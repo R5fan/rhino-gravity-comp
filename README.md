@@ -71,15 +71,18 @@ The live window shows what the script is doing: the stick position and the force
 If you use a pot on the stick as master gain, the script can take that job over, and then keep the anti-sag force correct at every gain setting. Without this, turning the gain down also weakens the script's force, so the stick sags again.
 
 1. In the VPforce configurator, set **Pot#1 Function** to an axis, for example **Rx**, instead of Master Gain.
-2. Tell the script once which axis it is (it's saved):
+2. Let the script find the pot (it's saved). Leave the stick alone and turn the pot slowly from end to end, twice, within 15 seconds:
 
    ```
-   py -3.13 rhino_gravity_comp.py --gain-pot rx
+   py -3.13 rhino_gravity_comp.py --find-pot
    ```
 
+   It reports where it found the pot and its range, for example `Found the pot: byte 11, 16-bit, range 0-4080`. Where the pot shows up in the stick's data can differ between firmware versions, which is why it's located rather than assumed.
 3. Calibrate once with this version (it records the gain it calibrated at), then fly as usual.
 
 While the script runs, turning the pot moves the configurator's Master Gain slider, and the script scales its own force to match. The status line shows the current gain and the pot's raw value.
+
+- **Safety:** the script doesn't touch Master Gain until it has seen the pot move. Until then the gain stays as it is, so a wrong or dead pot reading can't zero it.
 
 - `--gain-range 20 100` limits the pot's range, here from 20% to 100% master gain.
 - `--gain-pot off` switches it off again.
@@ -144,7 +147,8 @@ py -3.13 rhino_gravity_comp.py --help
 | `--points N` | Positions per axis during calibration (default 7) |
 | `--range R` | How far out to measure, as a fraction of full travel (default 0.7) |
 | `--max F` | Force limit, as a fraction of full (default 0.6) |
-| `--gain-pot AXIS` | Let a pot on this axis (`rx`, `ry`, `rz`, `z`, `slider`) drive Master Gain; `off` to stop (saved) |
+| `--find-pot` | Locate the pot in the stick's data and let it drive Master Gain (saved) |
+| `--gain-pot off` | Stop the pot driving Master Gain (saved) |
 | `--gain-range LOW HIGH` | Master gain at the pot's two ends, in percent (saved) |
 
 ## License

@@ -78,6 +78,7 @@ GAIN_MASTER = 1                # configurator slider ids (TelemFFB FFB_GAIN_*)
 
 # extra axes in the input report: <BhhhBBBB = id, X, Y, Z, Rz, Ry, Rx, Slider
 POT_AXES = ("z", "rz", "ry", "rx", "slider")
+POT_RAW = {"spec": None}       # set from config when --find-pot located the pot
 CONTROL_RESET = 4
 
 EFFECT_CONSTANT, EFFECT_SPRING = 1, 8
@@ -210,7 +211,7 @@ def load_config():
             cfg[axis]["c"][0] = float(v)
         elif isinstance(v, dict):
             cfg[axis].update(v)
-    for key in ("gain", "gain_pot", "gain_range"):  # see GainKnob
+    for key in ("gain", "gain_pot", "gain_range", "gain_pot_raw"):  # see GainKnob
         if key in raw:
             cfg[key] = raw[key]
     return cfg
@@ -311,6 +312,7 @@ class Rhino:
         self.spring_id = None
         self.closing = False
         self.extra = {}                  # pot / extra axes, raw values
+        self.last_input = b""
         self.connect()
 
     # ---- connection / allocation ----------------------------------------
@@ -400,9 +402,13 @@ class Rhino:
             return True
         if latest:
             _, x, y = struct.unpack_from("<Bhh", latest)
+            self.last_input = latest
             if len(latest) >= 11:
                 z, rz, ry, rx, sl = struct.unpack_from("<hBBBB", latest, 5)
                 self.extra = {"z": z, "rz": rz, "ry": ry, "rx": rx, "slider": sl}
+            raw_pot = POT_RAW.get("spec")
+            if raw_pot and len(latest) >= raw_pot["offset"] + struct.calcsize(raw_pot["fmt"]):
+                self.extra["raw"] = struct.unpack_from(raw_pot["fmt"], latest, raw_pot["offset"])[0]
             now = time.perf_counter()
             raw = (clamp(x / 4096, -1, 1), clamp(y / 4096, -1, 1))
             if self.pos is None:
@@ -797,11 +803,21 @@ class GainKnob:
         self.warned_clip = 0.0
         self.warned_no_axis = False
         self.log_at = 0.0
+        self.armed = False
+        self.first_v = None
+        if self.axis == "raw":
+            POT_RAW["spec"] = cfg.get("gain_pot_raw")
+            if not POT_RAW["spec"]:
+                self.axis = None
 
     def pot_fraction(self):
         raw = self.rh.extra.get(self.axis)
         if raw is None:
             return None
+        if self.axis == "raw":                     # located by --find-pot
+            spec = POT_RAW["spec"]
+            span = spec["max"] - spec["min"]
+            return clamp((raw - spec["min"]) / span, 0.0, 1.0) if span else None
         if self.axis == "z":                       # int16, -4096..4096
             return clamp((raw + 4096) / 8192, 0.0, 1.0)
         return clamp(raw / 255, 0.0, 1.0)          # uint8 axes
@@ -810,7 +826,21 @@ class GainKnob:
         now = time.time()
         if self.axis:
             v = self.pot_fraction()
-            if v is None:
+            # Safety: don't touch master gain until the pot has visibly moved,
+            # so a wrong or dead axis can never zero the gain.
+            if v is not None and not self.armed:
+                if self.first_v is None:
+                    self.first_v = v
+                    print("\n[GAIN] Waiting for you to turn the pot before it takes over "
+                          "master gain.")
+                if abs(v - self.first_v) >= 0.03:
+                    self.armed = True
+                    print("\n[GAIN] Pot detected - master gain now follows it.")
+                else:
+                    v = "wait"
+            if v == "wait":
+                pass
+            elif v is None:
                 if not self.warned_no_axis and now > self.next_read:
                     self.warned_no_axis = True
                     print(f"\n[WARN] No value from the {self.axis} axis yet - is the pot "
@@ -1184,6 +1214,72 @@ def app(worker, title, show, keep_open_when_done):
         pass
 
 
+def find_pot(args):
+    """Locate the pot in the stick's input report: the user turns it end to
+    end while the stick is left alone, and we look at which bytes changed."""
+    rh = Rhino()
+    print("\n=== FIND THE POT ===")
+    print("Leave the stick and buttons alone. Within the next 15 seconds, turn the pot slowly")
+    print("from one end to the other and back, twice. (Ctrl+C aborts)\n")
+    samples, end, next_dot = [], time.time() + 15, 0
+    try:
+        while time.time() < end:
+            rh.poll()
+            if rh.last_input:
+                samples.append(bytes(rh.last_input))
+            if time.time() >= next_dot:
+                print(f"\r{int(end - time.time()):2d} s left, {len(samples)} reports   ",
+                      end="", flush=True)
+                next_dot = time.time() + 0.5
+            time.sleep(0.005)
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        rh.close()
+        return
+    rh.close()
+    print()
+    if len(samples) < 50:
+        print("Too few reports from the stick to tell anything.")
+        return
+    n = min(len(r) for r in samples)
+    changed = [i for i in range(5, n) if len({r[i] for r in samples}) > 1]   # skip id, X, Y
+    print("Bytes that changed:", ", ".join(f"{i} ({min(r[i] for r in samples)}-"
+                                            f"{max(r[i] for r in samples)})" for i in changed)
+          or "none")
+    # candidates: single bytes and little-endian 16-bit pairs
+    cands = []
+    for i in changed:
+        for fmt, size in (("<B", 1), ("<H", 2), ("<h", 2)):
+            if i + size > n:
+                continue
+            vals = [struct.unpack_from(fmt, r, i)[0] for r in samples]
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 3:
+                continue
+            # a real pot moves smoothly: big jumps between reports mean we are
+            # looking at the low byte of a wider value, or a wrong sign
+            steps = sorted(abs(a - b) for a, b in zip(vals, vals[1:]))
+            typical_big = steps[int(0.99 * (len(steps) - 1))]   # ignore rare spikes
+            smooth = typical_big <= 0.15 * (hi - lo)
+            full = 255 if size == 1 else 65535
+            cands.append({"offset": i, "fmt": fmt, "min": lo, "max": hi,
+                          "smooth": smooth, "score": (hi - lo) / full * (10 if smooth else 1)
+                          + (0.5 if size == 2 and smooth else 0)})
+    good = [c for c in cands if c["smooth"]]
+    if not good:
+        print("Couldn't find anything that moves like a pot. Is it assigned to an axis in the "
+              "configurator (Pot#1 Function)?")
+        return
+    best = max(good, key=lambda c: c["score"])
+    kind = {"<B": "8-bit", "<H": "16-bit", "<h": "16-bit signed"}[best["fmt"]]
+    print(f"Found the pot: byte {best['offset']}, {kind}, range {best['min']}-{best['max']}.")
+    cfg = load_config()
+    cfg["gain_pot"] = "raw"
+    cfg["gain_pot_raw"] = {k: best[k] for k in ("offset", "fmt", "min", "max")}
+    save_config(cfg)
+    print("Master gain will follow this pot from now on (--gain-pot off to stop).")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Position-aware anti-gravity force for a VPforce Rhino")
     ap.add_argument("--calibrate", action="store_true", help="measure gravity across the travel")
@@ -1199,6 +1295,9 @@ def main():
                     help="how far out to measure, fraction of full travel (0.7)")
     ap.add_argument("--max", type=float, default=0.6, help="force limit, fraction of full (0.6)")
     ap.add_argument("--tolerance", type=float, default=0.006, help="calibration: close enough")
+    ap.add_argument("--find-pot", action="store_true",
+                    help="locate the pot in the stick's data (turn it end to end) and use it "
+                         "for master gain")
     ap.add_argument("--gain-pot", choices=POT_AXES + ("off",),
                     help="let a pot assigned to this axis drive the Master Gain slider "
                          "(saved; 'off' to stop)")
@@ -1219,6 +1318,9 @@ def main():
         print(f"Gain pot: {cfg.get('gain_pot') or 'off'}, range {cfg.get('gain_range') or [0, 100]}%")
         return
     sys.stdout = Tee(sys.stdout)
+    if args.find_pot:
+        find_pot(args)
+        return
     if args.clear:
         rh = Rhino()
         rh.reset_device()
