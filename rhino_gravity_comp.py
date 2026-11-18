@@ -628,7 +628,15 @@ def calibrate(args):
     SH.cfg = cfg
     rh = Rhino()
     rh.reset_device()          # clear leftovers (e.g. a spring from an interrupted run)
+    gains = rh.get_gains()
+    if gains and gains[0] * gains[1] / 100.0 < 20:
+        say(f"Master gain is {gains[0]}% and the constant-force slider {gains[1]}%: too low to "
+            f"calibrate. Set both to your normal flying level in the configurator (at least "
+            f"20%), then run --calibrate again.")
+        rh.close()
+        return
     axes = ["pitch"] + (["roll"] if not args.pitch_only else [])
+    measured = []
     targets = [-args.range + 2 * args.range * i / (args.points - 1) for i in range(args.points)]
     say("\n=== CALIBRATION ===")
     say("Close all flight sims and TelemFFB first. The stick will be moved to several positions by a")
@@ -727,6 +735,7 @@ def calibrate(args):
             c = fit_curve(points)
             lo, hi = min(p[0] for p in points), max(p[0] for p in points)
             cfg[axis] = {"c": [round(v, 5) for v in c], "lo": lo, "hi": hi, "points": points}
+            measured.append(axis)
             worst = max(abs(curve_force(cfg[axis], u) - f) for u, f in points)
             say(f"[{axis}] curve: {c[0]:+.3f} {c[1]:+.3f}*u {c[2]:+.3f}*u^2   "
                   f"(fit error at most {worst:.3f})")
@@ -738,9 +747,12 @@ def calibrate(args):
             setf()
             nap(0.8)
         SH.target = None
-        cfg["gain"] = rh.effective_gain()
-        save_config(cfg)
-        SH.status = "Calibration done and saved - close the window."
+        if not measured:
+            say("Nothing could be measured - the old calibration is kept, nothing saved.")
+        else:
+            cfg["gain"] = rh.effective_gain()
+            save_config(cfg)
+            SH.status = "Calibration done and saved - close the window."
     except KeyboardInterrupt:
         say("\nAborted, nothing saved.")
     finally:
@@ -784,6 +796,7 @@ class GainKnob:
         self.clipped = False
         self.warned_clip = 0.0
         self.warned_no_axis = False
+        self.log_at = 0.0
 
     def pot_fraction(self):
         raw = self.rh.extra.get(self.axis)
@@ -809,9 +822,19 @@ class GainKnob:
                 # change only on a real move (hysteresis) and at most 10x a second
                 if (self.set_val is None or abs(self.exact - self.set_val) > 0.7) \
                         and now >= self.next_write:
+                    first = self.set_val is None
                     self.rh.set_master_gain(target)
                     self.set_val = self.master = target
                     self.next_write = now + 0.1
+                    self.log_at = now + 0.6          # report once the pot stops moving
+                    if first:
+                        self.log_at = 0.0
+                        print(f"\n[GAIN] Master gain set to {target}% from the pot "
+                              f"({self.axis} = {self.rh.extra.get(self.axis)})")
+        if self.log_at and now >= self.log_at:
+            self.log_at = 0.0
+            print(f"\n[GAIN] Master gain now {self.set_val}% "
+                  f"({self.axis} = {self.rh.extra.get(self.axis)})")
         if now >= self.next_read:                  # pick up slider changes made elsewhere
             g = self.rh.get_gains()
             if g:
@@ -1194,6 +1217,7 @@ def main():
             cfg["gain_range"] = [lo, hi]
         save_config(cfg)
         print(f"Gain pot: {cfg.get('gain_pot') or 'off'}, range {cfg.get('gain_range') or [0, 100]}%")
+        return
     sys.stdout = Tee(sys.stdout)
     if args.clear:
         rh = Rhino()
