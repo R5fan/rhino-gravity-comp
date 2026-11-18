@@ -83,7 +83,7 @@ If you use a pot on the stick as master gain, the script can take that job over,
 While the script runs, turning the pot moves the configurator's Master Gain slider, and the script scales its own force to match. The status line shows the current gain and the pot's raw value.
 
 - **Safety:** the script doesn't touch Master Gain until it has seen the pot move. Until then the gain stays as it is, so a wrong or dead pot reading can't zero it.
-- **Beeps:** turning the pot gives a short pip at every 10% step, higher for more gain. The Rhino's own buzzer can't be driven from outside, so the pip is a tiny, fast vibration of the motors. It needs the configurator's Periodic Effects slider above 0. `--beep off` switches the pips off (saved).
+- **Beeps:** turning the pot makes the PC beep at every 10% step, higher for more gain. `--beep off` switches the beeps off (saved).
 
 - `--gain-range 20 100` limits the pot's range, here from 20% to 100% master gain.
 - `--gain-pot off` switches it off again.
@@ -151,7 +151,7 @@ py -3.13 rhino_gravity_comp.py --help
 | `--find-pot` | Locate the pot in the stick's data and let it drive Master Gain (saved) |
 | `--gain-pot off` | Stop the pot driving Master Gain (saved) |
 | `--gain-range LOW HIGH` | Master gain at the pot's two ends, in percent (saved) |
-| `--beep on` / `--beep off` | Pips through the motors when the pot changes master gain (saved) |
+| `--beep on` / `--beep off` | Beep on the PC when the pot changes master gain (saved) |
 
 ## License
 

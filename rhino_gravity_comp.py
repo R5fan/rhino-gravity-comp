@@ -56,6 +56,19 @@ try:
 except ImportError:
     msvcrt = None
 
+try:
+    import winsound  # Windows: beep through the PC's speakers
+except ImportError:
+    winsound = None
+
+
+def pc_beep(freq, ms=50):
+    """A short beep on the PC, played in the background so nothing waits."""
+    if not winsound:
+        return
+    threading.Thread(target=lambda: winsound.Beep(int(clamp(freq, 37, 32767)), int(ms)),
+                     daemon=True).start()
+
 # --------------------------------------------------------------------------
 # Rhino HID protocol (from VPforce TelemFFB, telemffb/hw/ffb_rhino.py)
 # --------------------------------------------------------------------------
@@ -67,7 +80,6 @@ REP_CREATE_EFFECT = 5          # feature: [5, type, 0, 0]
 REP_BLOCK_LOAD = 6             # feature read: [6, effect_id, status, ...]
 REP_SET_EFFECT = 101           # <BBBHHHHBBBBH
 REP_SET_CONDITION = 103        # <BBBhhhHHH
-REP_SET_PERIODIC = 104         # <BBHhBH  magnitude 0..4096, offset, phase, period (ms)
 REP_SET_CONSTANT_FORCE = 105   # <BBh  magnitude -4096..4096
 REP_EFFECT_OPERATION = 110     # <BBBB
 REP_BLOCK_FREE = 111           # <BB
@@ -82,7 +94,7 @@ POT_AXES = ("z", "rz", "ry", "rx", "slider")
 POT_RAW = {"spec": None}       # set from config when --find-pot located the pot
 CONTROL_RESET = 4
 
-EFFECT_CONSTANT, EFFECT_SINE, EFFECT_SPRING = 1, 4, 8
+EFFECT_CONSTANT, EFFECT_SPRING = 1, 8
 LOAD_SUCCESS = 1
 OP_START, OP_STOP = 1, 3
 AXIS_X, AXIS_Y, AXIS_DIR = 1, 2, 4
@@ -299,7 +311,6 @@ class HidDev:
 class Rhino:
     SLOT = 20         # park our force here, far above the slots sims use
     SPRING_SLOT = 21  # calibration spring, also out of the sim's way
-    BEEP_SLOT = 22    # short tones through the motors
     OUR_SLOTS = range(20, 26)   # anything here is ours (maybe left by a killed run)
 
     def __init__(self):
@@ -314,7 +325,6 @@ class Rhino:
         self.spring_id = None
         self.closing = False
         self.extra = {}                  # pot / extra axes, raw values
-        self.beep_id = None
         self.last_input = b""
         self.connect()
 
@@ -487,25 +497,6 @@ class Rhino:
                                            block, off, k, k, 4096, 4096, 0))
         self._guarded(_do)
 
-    # ---- beeps -------------------------------------------------------------
-    def beep(self, freq=440, ms=60, volume=0.2):
-        """A short tone played through the motors (a quick, tiny vibration).
-        The Rhino's own buzzer can't be driven from outside, so this is the
-        next best thing. Scaled by master gain and the Periodic slider."""
-        def _do():
-            if self.beep_id is None:
-                self.beep_id = self._create_high(EFFECT_SINE, self.BEEP_SLOT)
-                if not self.beep_id:
-                    return
-            self.dev.write(struct.pack("<BBBHHHHBBBBH", REP_SET_EFFECT, self.beep_id,
-                                       EFFECT_SINE, int(ms), 0, 0, 4096, 0,
-                                       AXIS_DIR | SOURCE_TELEMFFB, 0, 0, 0))
-            self.dev.write(struct.pack("<BBHhBH", REP_SET_PERIODIC, self.beep_id,
-                                       round(4096 * clamp(volume, 0, 1)), 0, 0,
-                                       max(1, round(1000 / freq))))
-            self.dev.write(struct.pack("<BBBB", REP_EFFECT_OPERATION, self.beep_id, OP_START, 1))
-        self._guarded(_do)
-
     # ---- configurator gain sliders ---------------------------------------
     def get_gains(self):
         """(master %, constant-force %) as the configurator sliders stand,
@@ -538,7 +529,6 @@ class Rhino:
             self.dev.write(bytes([REP_DEVICE_CONTROL, CONTROL_RESET]))
             time.sleep(0.2)
             self.spring_id = None
-            self.beep_id = None
             self.eid = self._create_high(EFFECT_CONSTANT)
             if not self.eid:
                 raise IOError("couldn't re-create the effect after reset")
@@ -575,7 +565,6 @@ class Rhino:
         for p in probes:
             self._free(p)
         if reclaimed:
-            self.beep_id = None
             print(f"\n[INFO] Effect had been wiped (the sim took or released the stick)"
                   f" - restored in slot {self.eid}")
         self.started = False
@@ -644,8 +633,6 @@ class Rhino:
             self.dev.write(struct.pack("<BBBB", REP_EFFECT_OPERATION, self.eid, OP_STOP, 0))
             self._free(self.eid)
             self.spring_free()
-            if self.beep_id:
-                self._free(self.beep_id)
         except Exception:
             pass
         self.dev.close()
@@ -897,7 +884,7 @@ class GainKnob:
                     self.armed = True
                     print("\n[GAIN] Pot detected - master gain now follows it.")
                     if self.beep_on:
-                        self.rh.beep(660, 50)
+                        pc_beep(880, 60)
                 else:
                     v = "wait"
             if v == "wait":
@@ -945,7 +932,7 @@ class GainKnob:
                   f"with --max.")
 
     def maybe_beep(self, gain):
-        """A pip each time the gain crosses a 10% step, higher for more gain."""
+        """A beep each time the gain crosses a 10% step, higher for more gain."""
         bucket = int(gain // 10)
         if self.beep_bucket is None:
             self.beep_bucket = bucket
@@ -953,12 +940,7 @@ class GainKnob:
         if bucket != self.beep_bucket:
             self.beep_bucket = bucket
             if self.beep_on:
-                # the tone is itself scaled by master gain: keep it audible when low
-                vol = clamp(0.15 / max(gain / 100.0, 0.25), 0.0, 0.6)
-                # the stick takes the tone's period in whole ms: 10 ms (100 Hz) at
-                # 0% up to 3 ms (333 Hz) at 100%, so each step sounds different
-                period = 10 - round(7 * gain / 100)
-                self.rh.beep(1000 / period, 45, vol)
+                pc_beep(400 + 6 * gain, 40)        # 400 Hz at 0% ... 1000 Hz at 100%
 
     def effective(self):
         if self.master is None or self.const is None:
@@ -1383,7 +1365,7 @@ def main():
     ap.add_argument("--gain-range", type=int, nargs=2, metavar=("LOW", "HIGH"),
                     help="master gain at the pot's two ends, in percent (saved; default 0 100)")
     ap.add_argument("--beep", choices=("on", "off"),
-                    help="pips through the motors when the pot changes master gain (saved)")
+                    help="beep on the PC when the pot changes master gain (saved)")
     ap.add_argument("--check", type=float, default=1.0,
                     help="seconds between 'effect still alive?' checks, 0 = off")
     args = ap.parse_args()
